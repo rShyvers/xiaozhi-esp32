@@ -99,12 +99,7 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
-        static uint32_t s_output_calls = 0;
-        static uint32_t s_pre_roll_calls = 0;
-        static uint32_t s_send_calls = 0;
-        s_output_calls++;
         if (pre_roll_enabled_ && !sending_enabled_) {
-            s_pre_roll_calls++;
             std::lock_guard<std::mutex> lock(pre_roll_mutex_);
             pre_roll_total_samples_ += data.size();
             pre_roll_buffer_.push_back(data);  // copy: `data` is still needed below
@@ -114,13 +109,7 @@ void AudioService::Initialize(AudioCodec* codec) {
             }
         }
         if (sending_enabled_) {
-            s_send_calls++;
             PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
-        }
-        if ((s_output_calls % 50) == 0) {
-            ESP_LOGI(TAG, "OnOutput: total=%u pre_roll=%u sent=%u pre_roll_enabled=%d sending_enabled=%d chunk_size=%u",
-                     (unsigned)s_output_calls, (unsigned)s_pre_roll_calls, (unsigned)s_send_calls,
-                     (int)pre_roll_enabled_.load(), (int)sending_enabled_.load(), (unsigned)data.size());
         }
     });
 
