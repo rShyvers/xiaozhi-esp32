@@ -99,7 +99,29 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        static uint32_t s_output_calls = 0;
+        static uint32_t s_pre_roll_calls = 0;
+        static uint32_t s_send_calls = 0;
+        s_output_calls++;
+        if (pre_roll_enabled_ && !sending_enabled_) {
+            s_pre_roll_calls++;
+            std::lock_guard<std::mutex> lock(pre_roll_mutex_);
+            pre_roll_total_samples_ += data.size();
+            pre_roll_buffer_.push_back(data);  // copy: `data` is still needed below
+            while (pre_roll_total_samples_ > kPreRollMaxSamples && !pre_roll_buffer_.empty()) {
+                pre_roll_total_samples_ -= pre_roll_buffer_.front().size();
+                pre_roll_buffer_.pop_front();
+            }
+        }
+        if (sending_enabled_) {
+            s_send_calls++;
+            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        }
+        if ((s_output_calls % 50) == 0) {
+            ESP_LOGI(TAG, "OnOutput: total=%u pre_roll=%u sent=%u pre_roll_enabled=%d sending_enabled=%d chunk_size=%u",
+                     (unsigned)s_output_calls, (unsigned)s_pre_roll_calls, (unsigned)s_send_calls,
+                     (int)pre_roll_enabled_.load(), (int)sending_enabled_.load(), (unsigned)data.size());
+        }
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -237,8 +259,15 @@ void AudioService::AudioInputTask() {
             break;
         }
         if (audio_input_need_warmup_) {
+            // Was a hardcoded 120ms delay here on every single transition
+            // into listening (not just after a wake word) — meant to let
+            // AFE's adaptive noise-suppression/AEC/VAD settle after
+            // (re)starting, but it unconditionally discarded the first
+            // 120ms of whatever the user was already saying. Skip straight
+            // to reading real audio instead; a few frames of
+            // not-fully-converged AFE filtering is a much smaller cost than
+            // losing the start of every reply.
             audio_input_need_warmup_ = false;
-            vTaskDelay(pdMS_TO_TICKS(120));
             continue;
         }
 
@@ -603,6 +632,37 @@ void AudioService::EnableVoiceProcessing(bool enable) {
     }
 }
 
+void AudioService::EnablePreRollCapture(bool enable) {
+    bool was_enabled = pre_roll_enabled_.exchange(enable);
+    if (was_enabled != enable) {
+        ESP_LOGI(TAG, "EnablePreRollCapture(%d)", (int)enable);
+    }
+}
+
+void AudioService::EnableSending(bool enable) {
+    ESP_LOGI(TAG, "EnableSending(%d)", (int)enable);
+    bool was_enabled = sending_enabled_.exchange(enable);
+    if (enable && !was_enabled) {
+        // Flush whatever was captured while we weren't sending yet — covers
+        // speech from the gap between wake word detection and the
+        // connection actually being ready.
+        std::deque<std::vector<int16_t>> flush;
+        {
+            std::lock_guard<std::mutex> lock(pre_roll_mutex_);
+            flush.swap(pre_roll_buffer_);
+            pre_roll_total_samples_ = 0;
+        }
+        size_t chunks = flush.size();
+        size_t samples = 0;
+        for (auto& chunk : flush) {
+            samples += chunk.size();
+            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(chunk));
+        }
+        ESP_LOGI(TAG, "EnableSending(true): flushed %u pre-roll chunks (%u samples, %.0fms)",
+                 (unsigned)chunks, (unsigned)samples, samples * 1000.0 / 16000.0);
+    }
+}
+
 void AudioService::EnableAudioTesting(bool enable) {
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
     if (enable) {
@@ -700,6 +760,14 @@ void AudioService::CheckAndUpdateAudioPowerState() {
 void AudioService::SetModelsList(srmodel_list_t* models_list) {
     models_list_ = models_list;
 
+    // If a wake word engine was already injected via SetWakeWord() (e.g.
+    // StackChan's MicroWakeWord), don't overwrite it with the ESP-SR
+    // default.  SetWakeWord() is always called before SetModelsList()
+    // during board initialization.
+    if (wake_word_) {
+        return;
+    }
+
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
     if (esp_srmodel_filter(models_list_, ESP_MN_PREFIX, NULL) != nullptr) {
         wake_word_ = std::make_unique<CustomWakeWord>();
@@ -715,6 +783,19 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
         wake_word_ = nullptr;
     }
 #endif
+
+    if (wake_word_) {
+        wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
+            if (callbacks_.on_wake_word_detected) {
+                callbacks_.on_wake_word_detected(wake_word);
+            }
+        });
+    }
+}
+
+void AudioService::SetWakeWord(std::unique_ptr<WakeWord> wake_word) {
+    wake_word_ = std::move(wake_word);
+    wake_word_initialized_ = false;
 
     if (wake_word_) {
         wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {

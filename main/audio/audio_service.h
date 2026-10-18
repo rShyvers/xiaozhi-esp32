@@ -3,9 +3,11 @@
 
 #include <memory>
 #include <deque>
+#include <vector>
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -125,6 +127,29 @@ public:
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 
+    // Gates whether the audio processor's already-flowing AFE-filtered
+    // output actually gets queued for opus-encoding/sending to the server —
+    // independent of whether the processor itself is running. Lets the
+    // processor stay continuously warm (feeding it audio, converging its
+    // adaptive noise-suppression/VAD filters) across an idle→listening
+    // transition, so there's no restart/warmup gap right when we actually
+    // want to start sending.
+    //
+    // Turning this on flushes whatever was captured by EnablePreRollCapture()
+    // below first — covers the gap between wake word detection and the
+    // connection actually being ready (a few hundred ms, network-dependent),
+    // during which someone speaking right through the wake word without
+    // pausing would otherwise have that speech processed but never sent.
+    void EnableSending(bool enable);
+
+    // Gates whether AFE-filtered output gets buffered (~2s rolling window)
+    // for EnableSending(true) to flush. Only meaningful — and only safe —
+    // while genuinely idle/waiting: leave this off while speaking (TTS
+    // playback), since without device-side AEC on this board the mic picks
+    // up the device's own voice, and we don't want that bleeding into the
+    // pre-roll for the next turn.
+    void EnablePreRollCapture(bool enable);
+
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
@@ -133,6 +158,10 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+    // Injects a WakeWord implementation directly, bypassing the ESP-SR
+    // models_list-based selection in SetModelsList(). Used by boards that
+    // supply their own wake word engine (e.g. StackChan's microWakeWord).
+    void SetWakeWord(std::unique_ptr<WakeWord> wake_word);
 
 private:
     AudioCodec* codec_ = nullptr;
@@ -179,6 +208,12 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    std::atomic<bool> sending_enabled_ = false;
+    std::atomic<bool> pre_roll_enabled_ = false;
+    std::mutex pre_roll_mutex_;
+    std::deque<std::vector<int16_t>> pre_roll_buffer_;
+    size_t pre_roll_total_samples_ = 0;
+    static constexpr size_t kPreRollMaxSamples = 32000;  // ~2s at 16kHz mono
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

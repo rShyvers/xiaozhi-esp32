@@ -33,3 +33,7 @@ uint8_t I2cDevice::ReadReg(uint8_t reg) {
 void I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
     ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100));
 }
+
+esp_err_t I2cDevice::TryReadRegs(uint8_t reg, uint8_t* buffer, size_t length, int timeout_ms) {
+    return i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, timeout_ms);
+}

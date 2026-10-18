@@ -432,12 +432,19 @@ void Application::CheckNewVersion() {
         retry_count = 0;
         retry_delay = 10; // Reset retry delay
 
+        // NOTE: Firmware upgrade skipped for StackChan custom builds.
+        // The upstream tenclass OTA server would overwrite the custom
+        // wake-word engine, BLE provisioning, and StackChan HAL.  We
+        // still need the rest of CheckVersion() above because it
+        // fetches fresh mqtt/websocket credentials and server_time.
+#if !defined(CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN)
         if (ota_->HasNewVersion()) {
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
                 return; // This line will never be reached after reboot
             }
             // If upgrade failed, continue to normal operation
         }
+#endif
 
         // No new version, mark the current version as valid
         ota_->MarkCurrentVersionValid();
@@ -866,8 +873,25 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
+#if defined(CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN)
+            display->SetEmotion("sleepy");
+            // Keep audio processor running (warm) and buffer ~2s of
+            // AFE-filtered audio in the pre-roll circular buffer.
+            // When EnableSending(true) fires on wake, this buffer
+            // flushes first — capturing whatever the user said
+            // alongside "Hey Bitsy" before the connection was ready.
+            audio_service_.EnableSending(false);
+            audio_service_.EnablePreRollCapture(true);
+            if (!audio_service_.IsAudioProcessorRunning()) {
+                audio_service_.EnableVoiceProcessing(true);
+                audio_service_.EnableSending(false);  // re-gate after EnableVoiceProcessing resets state
+                audio_service_.EnablePreRollCapture(true); // re-arm after reset
+            }
+#else
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            audio_service_.EnableSending(false);
             audio_service_.EnableVoiceProcessing(false);
+#endif
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
@@ -890,6 +914,7 @@ void Application::HandleStateChangedEvent() {
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
                 audio_service_.EnableVoiceProcessing(true);
+                audio_service_.EnableSending(true);
             }
 
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING

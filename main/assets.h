@@ -68,13 +68,13 @@ private:
         bool checksum_valid_ = false;
     };
     
-    class EmoteStrategy : public AssetStrategy {
-    public:
-        bool Apply(Assets* assets) override;
-        bool InitializePartition(Assets* assets) override;
-        void UnApplyPartition(Assets* assets) override;
-        bool GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) override;
-    };
+    // class EmoteStrategy : public AssetStrategy {
+    // public:
+    //     bool Apply(Assets* assets) override;
+    //     bool InitializePartition(Assets* assets) override;
+    //     void UnApplyPartition(Assets* assets) override;
+    //     bool GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) override;
+    // };
     
     // Strategy instance
     std::unique_ptr<AssetStrategy> strategy_;
