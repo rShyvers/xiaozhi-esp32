@@ -77,7 +77,39 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+    StopKeepalive();
     websocket_.reset();
+}
+
+void WebsocketProtocol::KeepaliveTimerCallback(void* arg) {
+    auto* self = static_cast<WebsocketProtocol*>(arg);
+    if (self->websocket_ != nullptr && self->websocket_->IsConnected()) {
+        self->websocket_->Ping();
+    }
+}
+
+void WebsocketProtocol::StartKeepalive() {
+    StopKeepalive();
+    const esp_timer_create_args_t args = {
+        .callback = KeepaliveTimerCallback,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ws_keepalive",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &keepalive_timer_) == ESP_OK) {
+        // WS protocol-level ping every 25s so the server doesn't reap idle
+        // sessions; keeps the audio channel warm between conversations.
+        esp_timer_start_periodic(keepalive_timer_, 25ULL * 1000 * 1000);
+    }
+}
+
+void WebsocketProtocol::StopKeepalive() {
+    if (keepalive_timer_ != nullptr) {
+        esp_timer_stop(keepalive_timer_);
+        esp_timer_delete(keepalive_timer_);
+        keepalive_timer_ = nullptr;
+    }
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
@@ -167,6 +199,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     websocket_->OnDisconnected([this]() {
         ESP_LOGI(TAG, "Websocket disconnected");
+        StopKeepalive();
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
         }
@@ -192,6 +225,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
         SetError(Lang::Strings::SERVER_TIMEOUT);
         return false;
     }
+
+    StartKeepalive();
 
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();

@@ -53,7 +53,11 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->ns_init = false;
     }
 
-    afe_config->agc_init = false;
+    // AGC normalizes mic level so quiet speech keeps a consistent amplitude
+    // through NS/Opus/server-VAD. Was disabled, which left low-volume
+    // utterances under-represented for STT while the wake-word classifier
+    // still fired on them.
+    afe_config->agc_init = true;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
 #ifdef CONFIG_USE_DEVICE_AEC
@@ -91,6 +95,23 @@ size_t AfeAudioProcessor::GetFeedSize() {
 void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
     if (afe_data_ == nullptr) {
         return;
+    }
+
+    // TEMP(level-audit): peak raw mic level (pre-AFE), logged every 2s.
+    // Remove after the quiet-speech investigation.
+    {
+        static uint32_t last_log_ms = 0;
+        static int16_t peak = 0;
+        for (auto s : data) {
+            int16_t a = s < 0 ? -s : s;
+            if (a > peak) peak = a;
+        }
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - last_log_ms >= 2000) {
+            ESP_LOGI(TAG, "LEVEL raw_mic_peak=%d", peak);
+            peak = 0;
+            last_log_ms = now_ms;
+        }
     }
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
@@ -165,7 +186,25 @@ void AfeAudioProcessor::AudioProcessorTask() {
 
         if (output_callback_) {
             size_t samples = res->data_size / sizeof(int16_t);
-            
+
+            // TEMP(level-audit): peak AFE/NS-processed output level, logged every 2s.
+            // Compare against raw_mic_peak to see how much NS attenuates speech.
+            {
+                static uint32_t last_log_ms = 0;
+                static int16_t peak = 0;
+                for (size_t i = 0; i < samples; i++) {
+                    int16_t s = res->data[i];
+                    int16_t a = s < 0 ? -s : s;
+                    if (a > peak) peak = a;
+                }
+                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                if (now_ms - last_log_ms >= 2000) {
+                    ESP_LOGI(TAG, "LEVEL ns_out_peak=%d", peak);
+                    peak = 0;
+                    last_log_ms = now_ms;
+                }
+            }
+
             // Add data to buffer
             output_buffer_.insert(output_buffer_.end(), res->data, res->data + samples);
             

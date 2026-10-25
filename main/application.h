@@ -153,6 +153,10 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    // Opens the audio channel in the background when it is not already open,
+    // so the device stays conversation-ready without paying the connect cost
+    // at wake time. Rate-limited; safe to call from any trigger.
+    void EnsureAudioChannel();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
 

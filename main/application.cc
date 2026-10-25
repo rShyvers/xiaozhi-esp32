@@ -274,6 +274,9 @@ void Application::HandleNetworkConnectedEvent() {
             app->activation_task_handle_ = nullptr;
             vTaskDelete(NULL);
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
+    } else if (state == kDeviceStateIdle) {
+        // Network recovered while idle — restore the warm channel.
+        EnsureAudioChannel();
     }
 
     // Update the status bar immediately to show the network state
@@ -294,11 +297,47 @@ void Application::HandleNetworkDisconnectedEvent() {
     display->UpdateStatusBar(true);
 }
 
+void Application::EnsureAudioChannel() {
+    if (protocol_ == nullptr || protocol_->IsAudioChannelOpened()) {
+        return;
+    }
+    auto state = GetDeviceState();
+    if (state == kDeviceStateWifiConfiguring) {
+        return;  // No network to connect through yet
+    }
+
+    // Rate-limit reconnect attempts so a dead/unreachable server doesn't
+    // spawn a task every trigger.
+    static uint32_t last_attempt_ms = 0;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now_ms - last_attempt_ms < 5000) {
+        return;
+    }
+    last_attempt_ms = now_ms;
+
+    xTaskCreate([](void* arg) {
+        auto* app = static_cast<Application*>(arg);
+        // Only open while idle: the main loop owns the channel during
+        // listening/speaking, and a concurrent OpenAudioChannel would race it.
+        if (app->GetDeviceState() == kDeviceStateIdle &&
+            app->protocol_ != nullptr &&
+            !app->protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "Opening audio channel in background");
+            app->protocol_->OpenAudioChannel();
+        }
+        vTaskDelete(NULL);
+    }, "ws_open", 4096, this, 3, NULL);
+}
+
 void Application::HandleActivationDoneEvent() {
     ESP_LOGI(TAG, "Activation done");
 
     SystemInfo::PrintHeapStats();
     SetDeviceState(kDeviceStateIdle);
+
+    // Pre-open the audio channel so the first conversation after boot is
+    // instant (wake -> send with no connect phase).
+    EnsureAudioChannel();
 
     has_server_time_ = ota_->HasServerTime();
 
@@ -520,6 +559,9 @@ void Application::InitializeProtocol() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
+            // Channel dropped — re-establish it in the background so the next
+            // wake doesn't pay the connect cost (rate-limited internally).
+            EnsureAudioChannel();
         });
     });
     
@@ -791,17 +833,14 @@ void Application::HandleWakeWordDetectedEvent() {
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
 
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update),
-            // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
-            });
-            return;
-        }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        // Always go through the connecting state and continue on the next main
+        // loop tick: ContinueWakeWordInvoke requires kDeviceStateConnecting,
+        // and it skips OpenAudioChannel when the channel is already warm, so a
+        // persistent channel still wakes in ~1 tick with no connect cost.
+        SetDeviceState(kDeviceStateConnecting);
+        Schedule([this, wake_word]() {
+            ContinueWakeWordInvoke(wake_word);
+        });
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
