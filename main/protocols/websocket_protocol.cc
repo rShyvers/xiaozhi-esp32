@@ -17,6 +17,15 @@ WebsocketProtocol::WebsocketProtocol() {
 }
 
 WebsocketProtocol::~WebsocketProtocol() {
+    *alive_ = false;
+    if (!ResetWebsocket()) {
+        // Ping has no bounded-send API. Never free its socket or task argument
+        // while it is still in use, even if shutdown has to wait for transport.
+        ESP_LOGW(TAG, "Waiting for stalled keepalive during shutdown");
+        xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_KEEPALIVE_STOPPED_EVENT,
+            pdFALSE, pdTRUE, portMAX_DELAY);
+        ResetWebsocket();
+    }
     vEventGroupDelete(event_group_handle_);
 }
 
@@ -26,10 +35,6 @@ bool WebsocketProtocol::Start() {
 }
 
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
-        return false;
-    }
-
     if (version_ == 2) {
         std::string serialized;
         serialized.resize(sizeof(BinaryProtocol2) + packet->payload.size());
@@ -41,7 +46,9 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         bp2->payload_size = htonl(packet->payload.size());
         memcpy(bp2->payload, packet->payload.data(), packet->payload.size());
 
-        return websocket_->Send(serialized.data(), serialized.size(), true);
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        return websocket_ && websocket_->IsConnected() &&
+            websocket_->Send(serialized.data(), serialized.size(), true);
     } else if (version_ == 3) {
         std::string serialized;
         serialized.resize(sizeof(BinaryProtocol3) + packet->payload.size());
@@ -51,18 +58,27 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         bp3->payload_size = htons(packet->payload.size());
         memcpy(bp3->payload, packet->payload.data(), packet->payload.size());
 
-        return websocket_->Send(serialized.data(), serialized.size(), true);
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        return websocket_ && websocket_->IsConnected() &&
+            websocket_->Send(serialized.data(), serialized.size(), true);
     } else {
-        return websocket_->Send(packet->payload.data(), packet->payload.size(), true);
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        return websocket_ && websocket_->IsConnected() &&
+            websocket_->Send(packet->payload.data(), packet->payload.size(), true);
     }
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
-        return false;
+    bool sent;
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        if (websocket_ == nullptr || !websocket_->IsConnected()) {
+            return false;
+        }
+        sent = websocket_->Send(text);
     }
 
-    if (!websocket_->Send(text)) {
+    if (!sent) {
         ESP_LOGE(TAG, "Failed to send text: %s", text.c_str());
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
@@ -72,47 +88,108 @@ bool WebsocketProtocol::SendText(const std::string& text) {
 }
 
 bool WebsocketProtocol::IsAudioChannelOpened() const {
-    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
+    // Conversation inactivity is not transport failure (Pongs are consumed
+    // below OnData). Socket disconnect/error and server close own liveness.
+    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !close_pending_;
 }
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
-    StopKeepalive();
-    websocket_.reset();
+    bool notify = websocket_ && websocket_->IsConnected();
+    if (ResetWebsocket() && notify && on_audio_channel_closed_) {
+        on_audio_channel_closed_();
+    }
 }
 
-void WebsocketProtocol::KeepaliveTimerCallback(void* arg) {
-    auto* self = static_cast<WebsocketProtocol*>(arg);
-    if (self->websocket_ != nullptr && self->websocket_->IsConnected()) {
-        self->websocket_->Ping();
+void WebsocketProtocol::KeepaliveTask() {
+    const auto generation = socket_generation_;
+    auto alive = alive_;
+    while (!stop_requested_) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(25000));
+        if (stop_requested_) {
+            break;
+        }
+        // Network I/O is confined to this task, never ESP_TIMER_TASK.
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        if (!stop_requested_ && websocket_ && websocket_->IsConnected()) {
+            websocket_->Ping();
+        }
     }
+    if (close_pending_) {
+        Application::GetInstance().ScheduleAfterAudioChannelOpen([this, alive, generation]() {
+            if (!*alive) {
+                return;
+            }
+            if (generation != socket_generation_ || !close_pending_) {
+                ESP_LOGD(TAG, "Dropping stale keepalive close request");
+                return;
+            }
+            // ResetWebsocket re-verifies the joined acknowledgement itself.
+            CloseAudioChannel();
+        });
+    }
+    // FreeRTOS task deletion does not run C++ stack destructors.
+    alive.reset();
+    // No access to this after signaling: the owner may now destroy us.
+    xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_KEEPALIVE_STOPPED_EVENT);
+    // The owner deletes the task after the acknowledgement, keeping its
+    // handle valid even if StopKeepalive races the final notification.
+    vTaskSuspend(nullptr);
 }
 
 void WebsocketProtocol::StartKeepalive() {
-    StopKeepalive();
-    const esp_timer_create_args_t args = {
-        .callback = KeepaliveTimerCallback,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "ws_keepalive",
-        .skip_unhandled_events = true,
-    };
-    if (esp_timer_create(&args, &keepalive_timer_) == ESP_OK) {
-        // WS protocol-level ping every 25s so the server doesn't reap idle
-        // sessions; keeps the audio channel warm between conversations.
-        esp_timer_start_periodic(keepalive_timer_, 25ULL * 1000 * 1000);
+    stop_requested_ = false;
+    close_pending_ = false;
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_KEEPALIVE_STOPPED_EVENT);
+    if (xTaskCreate([](void* arg) {
+        static_cast<WebsocketProtocol*>(arg)->KeepaliveTask();
+    }, "ws_keepalive", 4096, this, 3, &keepalive_task_) != pdPASS) {
+        keepalive_task_ = nullptr;
+        ESP_LOGW(TAG, "Failed to start websocket keepalive task");
     }
 }
 
-void WebsocketProtocol::StopKeepalive() {
-    if (keepalive_timer_ != nullptr) {
-        esp_timer_stop(keepalive_timer_);
-        esp_timer_delete(keepalive_timer_);
-        keepalive_timer_ = nullptr;
+bool WebsocketProtocol::StopKeepalive() {
+    if (keepalive_task_ == nullptr) {
+        return true;
     }
+    close_pending_ = true;
+    stop_requested_ = true;
+    // The owner retains the handle until the task acknowledges stopping.
+    if (!(xEventGroupGetBits(event_group_handle_) & WEBSOCKET_PROTOCOL_KEEPALIVE_STOPPED_EVENT)) {
+        xTaskNotifyGive(keepalive_task_);
+    }
+    auto bits = xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_KEEPALIVE_STOPPED_EVENT,
+        pdFALSE, pdTRUE, pdMS_TO_TICKS(500));
+    if (!(bits & WEBSOCKET_PROTOCOL_KEEPALIVE_STOPPED_EVENT)) {
+        ESP_LOGW(TAG, "Keepalive send stalled; deferring websocket close");
+        return false;
+    }
+    vTaskDelete(keepalive_task_);
+    keepalive_task_ = nullptr;
+    return true;
+}
+
+bool WebsocketProtocol::ResetWebsocket() {
+    if (!StopKeepalive()) {
+        return false;
+    }
+    // Joining the ping task is the lifetime barrier. Destruction is outside
+    // the socket-operation lock (the receive task may need to finish callbacks).
+    if (socket_alive_) {
+        *socket_alive_ = false;
+    }
+    websocket_.reset();
+    ++socket_generation_;
+    close_pending_ = false;
+    return true;
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
+    if (!ResetWebsocket()) {
+        return false;
+    }
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -141,7 +218,11 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
 
-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
+    socket_alive_ = std::make_shared<std::atomic<bool>>(true);
+    websocket_->OnData([this, socket_alive = socket_alive_](const char* data, size_t len, bool binary) {
+        if (!*socket_alive) {
+            return;
+        }
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
@@ -197,9 +278,18 @@ bool WebsocketProtocol::OpenAudioChannel() {
         last_incoming_time_ = std::chrono::steady_clock::now();
     });
 
-    websocket_->OnDisconnected([this]() {
+    websocket_->OnDisconnected([this, alive = alive_, socket_alive = socket_alive_, generation = socket_generation_]() {
+        if (!*socket_alive) {
+            return;
+        }
         ESP_LOGI(TAG, "Websocket disconnected");
-        StopKeepalive();
+        // Receive context only signals; joining here could deadlock its own
+        // socket teardown. Lifetime/generation fencing rejects stale requests.
+        Application::GetInstance().ScheduleAfterAudioChannelOpen([this, alive, generation]() {
+            if (*alive && generation == socket_generation_) {
+                CloseAudioChannel();
+            }
+        });
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
         }

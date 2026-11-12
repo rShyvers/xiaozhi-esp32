@@ -10,6 +10,7 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -120,6 +121,10 @@ public:
      */
     void ResetProtocol();
 
+    // Main-loop protocol work must wait until the single background opener
+    // releases ownership. Also used by MQTT's scheduled reconnect/goodbye.
+    void ScheduleAfterAudioChannelOpen(std::function<void()>&& callback);
+
 private:
     Application();
     ~Application();
@@ -142,6 +147,17 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    TaskHandle_t main_task_handle_ = nullptr;
+    std::atomic<bool> audio_channel_opening_{false};
+    std::atomic<bool> audio_channel_open_{false};
+    std::atomic<uint32_t> audio_channel_generation_{0};
+    std::function<void()> audio_channel_ready_;
+    std::deque<std::function<void()>> after_audio_channel_open_;
+    std::shared_ptr<std::atomic<bool>> protocol_alive_;
+    bool network_ready_ = false;
+    bool protocol_stopping_ = false;
+    int64_t next_audio_channel_attempt_ms_ = 0;
+    uint32_t audio_channel_retry_delay_ms_ = 5000;
 
 
     // Event handlers
@@ -153,10 +169,12 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
-    // Opens the audio channel in the background when it is not already open,
-    // so the device stays conversation-ready without paying the connect cost
-    // at wake time. Rate-limited; safe to call from any trigger.
+    // Main-loop-only channel ownership and clock-driven warm-idle retry.
     void EnsureAudioChannel();
+    void RequestAudioChannel(std::function<void()>&& ready);
+    void FinishAudioChannelOpen(bool opened, uint32_t generation);
+    void RunAfterAudioChannelOpen(std::function<void()>&& callback);
+    void CloseAudioChannel(bool send_goodbye = true);
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
 

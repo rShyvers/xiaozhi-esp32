@@ -11,6 +11,7 @@
 #include "settings.h"
 
 #include <cstring>
+#include <algorithm>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -162,6 +163,7 @@ void Application::Initialize() {
 
 void Application::Run() {
     // Set the priority of the main task to 10
+    main_task_handle_ = xTaskGetCurrentTaskHandle();
     vTaskPrioritySet(nullptr, 10);
 
     const EventBits_t ALL_EVENTS = 
@@ -217,7 +219,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                if (!audio_channel_opening_ && protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
             }
@@ -247,6 +249,7 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+            EnsureAudioChannel();
         
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -258,6 +261,8 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    network_ready_ = true;
+    audio_channel_retry_delay_ms_ = 5000;
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -285,11 +290,11 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
-    // Close current conversation when network disconnected
-    auto state = GetDeviceState();
-    if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+    network_ready_ = false;
+    // Also close a warm idle channel, but never tear down under the opener.
+    if (protocol_) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
-        protocol_->CloseAudioChannel();
+        CloseAudioChannel();
     }
 
     // Update the status bar immediately to show the network state
@@ -298,35 +303,111 @@ void Application::HandleNetworkDisconnectedEvent() {
 }
 
 void Application::EnsureAudioChannel() {
-    if (protocol_ == nullptr || protocol_->IsAudioChannelOpened()) {
+    if (!network_ready_ || protocol_stopping_ || audio_channel_opening_ ||
+        !protocol_ || GetDeviceState() != kDeviceStateIdle) {
         return;
     }
-    auto state = GetDeviceState();
-    if (state == kDeviceStateWifiConfiguring) {
-        return;  // No network to connect through yet
+    if (esp_timer_get_time() / 1000 < next_audio_channel_attempt_ms_) {
+        return;  // The clock tick will retry when the backoff expires.
     }
+    RequestAudioChannel({});
+}
 
-    // Rate-limit reconnect attempts so a dead/unreachable server doesn't
-    // spawn a task every trigger.
-    static uint32_t last_attempt_ms = 0;
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    if (now_ms - last_attempt_ms < 5000) {
+void Application::RequestAudioChannel(std::function<void()>&& ready) {
+    if (!protocol_ || protocol_stopping_) {
         return;
     }
-    last_attempt_ms = now_ms;
-
-    xTaskCreate([](void* arg) {
-        auto* app = static_cast<Application*>(arg);
-        // Only open while idle: the main loop owns the channel during
-        // listening/speaking, and a concurrent OpenAudioChannel would race it.
-        if (app->GetDeviceState() == kDeviceStateIdle &&
-            app->protocol_ != nullptr &&
-            !app->protocol_->IsAudioChannelOpened()) {
-            ESP_LOGI(TAG, "Opening audio channel in background");
-            app->protocol_->OpenAudioChannel();
+    if (ready) {
+        audio_channel_ready_ = std::move(ready);
+    }
+    if (audio_channel_opening_) {
+        ESP_LOGI(TAG, "Joining audio channel open");
+        return;
+    }
+    if (protocol_->IsAudioChannelOpened()) {
+        audio_channel_open_ = true;
+        auto continuation = std::move(audio_channel_ready_);
+        if (continuation) {
+            continuation();
         }
-        vTaskDelete(NULL);
-    }, "ws_open", 4096, this, 3, NULL);
+        return;
+    }
+    struct OpenRequest {
+        Application* app;
+        Protocol* protocol;
+        uint32_t generation;
+    };
+    auto* request = new OpenRequest{this, protocol_.get(), ++audio_channel_generation_};
+    // Publish ownership before task creation. Only this worker calls Open;
+    // every close/reset/reconnect waits for its main-loop completion.
+    audio_channel_opening_ = true;
+    next_audio_channel_attempt_ms_ = esp_timer_get_time() / 1000 + 5000;
+    ESP_LOGI(TAG, "Opening audio channel in background");
+    if (xTaskCreate([](void* arg) {
+        std::unique_ptr<OpenRequest> request(static_cast<OpenRequest*>(arg));
+        auto* app = request->app;
+        bool opened = request->protocol->OpenAudioChannel();
+        app->Schedule([app, opened, generation = request->generation]() {
+            app->FinishAudioChannelOpen(opened, generation);
+        });
+        request.reset();
+        vTaskDelete(nullptr);
+    }, "audio_open", 4096, request, 3, nullptr) != pdPASS) {
+        auto generation = request->generation;
+        delete request;
+        ESP_LOGE(TAG, "Failed to create audio channel opener");
+        FinishAudioChannelOpen(false, generation);
+    }
+}
+
+void Application::FinishAudioChannelOpen(bool opened, uint32_t generation) {
+    audio_channel_open_ = opened;
+    audio_channel_opening_ = false;
+    auto continuation = std::move(audio_channel_ready_);
+    if (opened) {
+        audio_channel_retry_delay_ms_ = 5000;
+    } else {
+        next_audio_channel_attempt_ms_ = esp_timer_get_time() / 1000 + audio_channel_retry_delay_ms_;
+        ESP_LOGW(TAG, "Audio channel open failed; retry in %lu ms", (unsigned long)audio_channel_retry_delay_ms_);
+        audio_channel_retry_delay_ms_ = std::min<uint32_t>(audio_channel_retry_delay_ms_ * 2, 30000);
+        if (GetDeviceState() == kDeviceStateConnecting) {
+            SetDeviceState(kDeviceStateIdle);
+            audio_service_.EnableWakeWordDetection(true);
+        }
+    }
+    auto deferred = std::move(after_audio_channel_open_);
+    for (auto& callback : deferred) {
+        callback();
+    }
+    if (opened && generation == audio_channel_generation_ && continuation &&
+        !protocol_stopping_ && network_ready_ && protocol_ && protocol_->IsAudioChannelOpened()) {
+        continuation();
+    }
+}
+
+void Application::RunAfterAudioChannelOpen(std::function<void()>&& callback) {
+    if (audio_channel_opening_) {
+        after_audio_channel_open_.push_back(std::move(callback));
+    } else {
+        callback();
+    }
+}
+
+void Application::ScheduleAfterAudioChannelOpen(std::function<void()>&& callback) {
+    Schedule([this, callback = std::move(callback)]() mutable {
+        RunAfterAudioChannelOpen(std::move(callback));
+    });
+}
+
+void Application::CloseAudioChannel(bool send_goodbye) {
+    ++audio_channel_generation_;
+    audio_channel_ready_ = {};
+    RunAfterAudioChannelOpen([this, send_goodbye]() {
+        if (protocol_) {
+            protocol_->CloseAudioChannel(send_goodbye);
+        }
+        audio_channel_open_ = false;
+    });
 }
 
 void Application::HandleActivationDoneEvent() {
@@ -367,11 +448,12 @@ void Application::ActivationTask() {
     // Check for new firmware version
     CheckNewVersion();
 
-    // Initialize the protocol
-    InitializeProtocol();
-
-    // Signal completion to main loop
-    xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
+    // Publish/replace protocol resources only on the main loop, after any
+    // previous channel opener has released them.
+    ScheduleAfterAudioChannelOpen([this]() {
+        InitializeProtocol();
+        xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
+    });
 }
 
 void Application::CheckAssetsVersion() {
@@ -520,6 +602,13 @@ void Application::InitializeProtocol() {
     auto codec = board.GetAudioCodec();
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+    if (protocol_alive_) {
+        *protocol_alive_ = false;
+    }
+    protocol_alive_ = std::make_shared<std::atomic<bool>>(true);
+    auto alive = protocol_alive_;
+    protocol_stopping_ = false;
+    ++audio_channel_generation_;
 
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
@@ -530,32 +619,50 @@ void Application::InitializeProtocol() {
         protocol_ = std::make_unique<MqttProtocol>();
     }
 
-    protocol_->OnConnected([this]() {
-        DismissAlert();
+    protocol_->OnConnected([this, alive]() {
+        Schedule([this, alive]() {
+            if (*alive) {
+                DismissAlert();
+            }
+        });
     });
 
-    protocol_->OnNetworkError([this](const std::string& message) {
-        last_error_message_ = message;
-        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+    protocol_->OnNetworkError([this, alive](const std::string& message) {
+        Schedule([this, alive, message]() {
+            if (*alive) {
+                last_error_message_ = message;
+                xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+            }
+        });
     });
     
-    protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+    protocol_->OnIncomingAudio([this, alive](std::unique_ptr<AudioStreamPacket> packet) {
+        if (*alive && GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
     
-    protocol_->OnAudioChannelOpened([this, codec, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
-        if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
-            ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
-                protocol_->server_sample_rate(), codec->output_sample_rate());
-        }
+    protocol_->OnAudioChannelOpened([this, codec, alive, &board]() {
+        ScheduleAfterAudioChannelOpen([this, codec, alive, &board]() {
+            if (!*alive || !protocol_ || protocol_stopping_ || !protocol_->IsAudioChannelOpened()) {
+                return;
+            }
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+            if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
+                ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
+                    protocol_->server_sample_rate(), codec->output_sample_rate());
+            }
+        });
     });
     
-    protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        Schedule([this]() {
+    protocol_->OnAudioChannelClosed([this, alive, &board]() {
+        auto generation = audio_channel_generation_.load();
+        Schedule([this, alive, generation, &board]() {
+            if (!*alive || protocol_stopping_ || generation != audio_channel_generation_) {
+                return;
+            }
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            audio_channel_open_ = false;
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -565,18 +672,27 @@ void Application::InitializeProtocol() {
         });
     });
     
-    protocol_->OnIncomingJson([this, display](const cJSON* root) {
+    protocol_->OnIncomingJson([this, display, alive](const cJSON* root) {
+        if (!*alive) {
+            return;
+        }
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
-                Schedule([this]() {
+                ScheduleAfterAudioChannelOpen([this, alive]() {
+                    if (!*alive || protocol_stopping_) {
+                        return;
+                    }
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
+                ScheduleAfterAudioChannelOpen([this, alive]() {
+                    if (!*alive || protocol_stopping_) {
+                        return;
+                    }
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -741,7 +857,7 @@ void Application::HandleToggleChatEvent() {
 
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
-        if (!protocol_->IsAudioChannelOpened()) {
+        if (audio_channel_opening_ || !protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
             Schedule([this, mode]() {
@@ -753,7 +869,7 @@ void Application::HandleToggleChatEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
-        protocol_->CloseAudioChannel();
+        CloseAudioChannel();
     }
 }
 
@@ -763,13 +879,11 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
         return;
     }
 
-    if (!protocol_->IsAudioChannelOpened()) {
-        if (!protocol_->OpenAudioChannel()) {
-            return;
+    RequestAudioChannel([this, mode]() {
+        if (GetDeviceState() == kDeviceStateConnecting) {
+            SetListeningMode(mode);
         }
-    }
-
-    SetListeningMode(mode);
+    });
 }
 
 void Application::HandleStartListeningEvent() {
@@ -790,7 +904,7 @@ void Application::HandleStartListeningEvent() {
     }
     
     if (state == kDeviceStateIdle) {
-        if (!protocol_->IsAudioChannelOpened()) {
+        if (audio_channel_opening_ || !protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
             Schedule([this]() {
@@ -848,6 +962,7 @@ void Application::HandleWakeWordDetectedEvent() {
 
         if (state == kDeviceStateListening) {
             protocol_->SendStartListening(GetDefaultListeningMode());
+            audio_service_.EnableSending(true);
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             // Re-enable wake word detection as it was stopped by the detection itself
@@ -869,11 +984,11 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
         return;
     }
 
-    if (!protocol_->IsAudioChannelOpened()) {
-        if (!protocol_->OpenAudioChannel()) {
-            audio_service_.EnableWakeWordDetection(true);
-            return;
-        }
+    if (audio_channel_opening_ || !protocol_ || !protocol_->IsAudioChannelOpened()) {
+        RequestAudioChannel([this, wake_word]() {
+            ContinueWakeWordInvoke(wake_word);
+        });
+        return;
     }
 
     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
@@ -940,19 +1055,18 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
-            // Make sure the audio processor is running
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for playback queue to be empty before enabling voice processing
-                // This prevents audio truncation when STOP arrives late due to network jitter
-                if (listening_mode_ == kListeningModeAutoStop) {
-                    audio_service_.WaitForPlaybackQueueEmpty();
-                }
-                
-                // Send the start listening command
-                protocol_->SendStartListening(listening_mode_);
-                audio_service_.EnableVoiceProcessing(true);
-                audio_service_.EnableSending(true);
+            // Entering a listening session is independent of restarting AFE:
+            // warm idle and realtime TTS both leave the processor running.
+            if (listening_mode_ == kListeningModeAutoStop) {
+                audio_service_.WaitForPlaybackQueueEmpty();
             }
+            if (protocol_) {
+                protocol_->SendStartListening(listening_mode_);
+            }
+            if (!audio_service_.IsAudioProcessorRunning()) {
+                audio_service_.EnableVoiceProcessing(true);
+            }
+            audio_service_.EnableSending(true);
 
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
             // Enable wake word detection in listening mode (configured via Kconfig)
@@ -999,9 +1113,11 @@ void Application::Schedule(std::function<void()>&& callback) {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
-    if (protocol_) {
-        protocol_->SendAbortSpeaking(reason);
-    }
+    RunAfterAudioChannelOpen([this, reason]() {
+        if (protocol_) {
+            protocol_->SendAbortSpeaking(reason);
+        }
+    });
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
@@ -1014,19 +1130,35 @@ ListeningMode Application::GetDefaultListeningMode() const {
 }
 
 void Application::Reboot() {
-    ESP_LOGI(TAG, "Rebooting...");
-    // Disconnect the audio channel
-    if (protocol_ && protocol_->IsAudioChannelOpened()) {
-        protocol_->CloseAudioChannel();
+    if (xTaskGetCurrentTaskHandle() != main_task_handle_) {
+        Schedule([this]() { Reboot(); });
+        return;
     }
-    protocol_.reset();
-    audio_service_.Stop();
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
+    protocol_stopping_ = true;
+    ++audio_channel_generation_;
+    audio_channel_ready_ = {};
+    RunAfterAudioChannelOpen([this]() {
+        ESP_LOGI(TAG, "Rebooting...");
+        if (protocol_alive_) {
+            *protocol_alive_ = false;
+        }
+        if (protocol_) {
+            protocol_->CloseAudioChannel();
+        }
+        protocol_.reset();
+        audio_service_.Stop();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    });
 }
 
 bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
+    // This synchronous API cannot join without blocking main-loop completion.
+    // Activation upgrades run before an opener exists; manual upgrades may retry.
+    if (audio_channel_opening_) {
+        ESP_LOGW(TAG, "Audio channel opening; retry firmware upgrade later");
+        return false;
+    }
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
 
@@ -1079,36 +1211,25 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
-    if (!protocol_) {
-        return;
-    }
-
-    auto state = GetDeviceState();
-    
-    if (state == kDeviceStateIdle) {
-        audio_service_.EncodeWakeWord();
-
-        if (!protocol_->IsAudioChannelOpened()) {
+    Schedule([this, wake_word]() {
+        if (!protocol_) {
+            return;
+        }
+        auto state = GetDeviceState();
+        if (state == kDeviceStateIdle) {
+            audio_service_.EncodeWakeWord();
+            // The public/manual wake path follows the same connecting guard
+            // as detector wakes, including an already-warm channel.
             SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
             Schedule([this, wake_word]() {
                 ContinueWakeWordInvoke(wake_word);
             });
-            return;
-        }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
-    } else if (state == kDeviceStateSpeaking) {
-        Schedule([this]() {
+        } else if (state == kDeviceStateSpeaking) {
             AbortSpeaking(kAbortReasonNone);
-        });
-    } else if (state == kDeviceStateListening) {   
-        Schedule([this]() {
-            if (protocol_) {
-                protocol_->CloseAudioChannel();
-            }
-        });
-    }
+        } else if (state == kDeviceStateListening) {
+            CloseAudioChannel();
+        }
+    });
 }
 
 bool Application::CanEnterSleepMode() {
@@ -1116,7 +1237,8 @@ bool Application::CanEnterSleepMode() {
         return false;
     }
 
-    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+    // Called from power-management context: do not race protocol replacement.
+    if (audio_channel_opening_ || audio_channel_open_) {
         return false;
     }
 
@@ -1130,7 +1252,7 @@ bool Application::CanEnterSleepMode() {
 
 void Application::SendMcpMessage(const std::string& payload) {
     // Always schedule to run in main task for thread safety
-    Schedule([this, payload = std::move(payload)]() {
+    ScheduleAfterAudioChannelOpen([this, payload = std::move(payload)]() {
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
         }
@@ -1158,8 +1280,8 @@ void Application::SetAecMode(AecMode mode) {
         }
 
         // If the AEC mode is changed, close the audio channel
-        if (protocol_ && protocol_->IsAudioChannelOpened()) {
-            protocol_->CloseAudioChannel();
+        if (protocol_) {
+            CloseAudioChannel();
         }
     });
 }
@@ -1170,12 +1292,19 @@ void Application::PlaySound(const std::string_view& sound) {
 
 void Application::ResetProtocol() {
     Schedule([this]() {
-        // Close audio channel if opened
-        if (protocol_ && protocol_->IsAudioChannelOpened()) {
-            protocol_->CloseAudioChannel();
-        }
-        // Reset protocol
-        protocol_.reset();
+        protocol_stopping_ = true;
+        ++audio_channel_generation_;
+        audio_channel_ready_ = {};
+        RunAfterAudioChannelOpen([this]() {
+            if (protocol_alive_) {
+                *protocol_alive_ = false;
+            }
+            if (protocol_) {
+                protocol_->CloseAudioChannel();
+            }
+            protocol_.reset();
+            audio_channel_open_ = false;
+        });
     });
 }
 

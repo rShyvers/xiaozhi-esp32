@@ -97,19 +97,31 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
         return;
     }
 
-    // TEMP(level-audit): peak raw mic level (pre-AFE), logged every 2s.
-    // Remove after the quiet-speech investigation.
+    // TEMP(level-audit): peak mic + echo-reference levels (pre-AFE), every 2s.
+    // ref_peak verifies ES7210 ch1 carries the speaker output (AEC routing).
     {
         static uint32_t last_log_ms = 0;
-        static int16_t peak = 0;
-        for (auto s : data) {
-            int16_t a = s < 0 ? -s : s;
-            if (a > peak) peak = a;
+        static int16_t peak_mic = 0, peak_ref = 0;
+        bool has_ref = codec_ != nullptr && codec_->input_reference();
+        size_t n = data.size();
+        if (has_ref && n >= 2) {
+            for (size_t i = 0; i + 1 < n; i += 2) {
+                int16_t a = data[i] < 0 ? -data[i] : data[i];
+                int16_t b = data[i + 1] < 0 ? -data[i + 1] : data[i + 1];
+                if (a > peak_mic) peak_mic = a;
+                if (b > peak_ref) peak_ref = b;
+            }
+        } else {
+            for (auto s : data) {
+                int16_t a = s < 0 ? -s : s;
+                if (a > peak_mic) peak_mic = a;
+            }
         }
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (now_ms - last_log_ms >= 2000) {
-            ESP_LOGI(TAG, "LEVEL raw_mic_peak=%d", peak);
-            peak = 0;
+            ESP_LOGI(TAG, "LEVEL mic_peak=%d ref_peak=%d", peak_mic, peak_ref);
+            peak_mic = 0;
+            peak_ref = 0;
             last_log_ms = now_ms;
         }
     }

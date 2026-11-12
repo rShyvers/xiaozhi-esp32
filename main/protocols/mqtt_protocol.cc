@@ -21,8 +21,8 @@ MqttProtocol::MqttProtocol() {
             if (app.GetDeviceState() == kDeviceStateIdle) {
                 ESP_LOGI(TAG, "Reconnecting to MQTT server");
                 auto alive = protocol->alive_;  // Capture alive flag
-                app.Schedule([protocol, alive]() {
-                    if (*alive) {
+                app.ScheduleAfterAudioChannelOpen([protocol, alive]() {
+                    if (*alive && (!protocol->mqtt_ || !protocol->mqtt_->IsConnected())) {
                         protocol->StartMqttClient(false);
                     }
                 });
@@ -115,15 +115,16 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s", session_id ? session_id->valuestring : "null");
-            if (session_id == nullptr || session_id_ == session_id->valuestring) {
-                auto alive = alive_;  // Capture alive flag
-                Application::GetInstance().Schedule([this, alive]() {
-                    if (*alive) {
-                        // Server initiated goodbye, don't send goodbye back to avoid ping-pong
-                        CloseAudioChannel(false);
-                    }
-                });
-            }
+            auto alive = alive_;
+            bool has_session = cJSON_IsString(session_id);
+            std::string session = has_session ? session_id->valuestring : "";
+            Application::GetInstance().ScheduleAfterAudioChannelOpen([this, alive, has_session, session]() {
+                // Compare on the owner task, after hello/session reset finishes.
+                // Do not apply an old goodbye to a replacement session.
+                if (*alive && (!has_session || session == session_id_)) {
+                    CloseAudioChannel(false);
+                }
+            });
         } else if (on_incoming_json_ != nullptr) {
             on_incoming_json_(root);
         }
@@ -385,5 +386,7 @@ std::string MqttProtocol::DecodeHexString(const std::string& hex_string) {
 }
 
 bool MqttProtocol::IsAudioChannelOpened() const {
-    return udp_ != nullptr && !error_occurred_ && !IsTimeout();
+    // Broker keepalive and server goodbye define transport/session liveness;
+    // an idle conversation is not a dead UDP channel.
+    return mqtt_ != nullptr && mqtt_->IsConnected() && udp_ != nullptr && !error_occurred_;
 }
