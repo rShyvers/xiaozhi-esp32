@@ -175,7 +175,23 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_FD_LOW_COST;
     afe_config->aec_nlp_level = AEC_NLP_LEVEL_VERYAGGR;
+#if defined(CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN)
+    // StackChan acoustic tuning (verified on v2.2.4): the upstream FD
+    // low-cost engine defaults to NS off; restore noise suppression and
+    // high-perf mode for desktop companion use in noisy rooms.
+    afe_config->afe_mode = AFE_MODE_HIGH_PERF;
+    {
+        char* ns_model_name =
+            models_ == nullptr ? nullptr : esp_srmodel_filter(models_, ESP_NSNET_PREFIX, NULL);
+        if (ns_model_name != nullptr) {
+            afe_config->ns_init = true;
+            afe_config->ns_model_name = ns_model_name;
+            afe_config->afe_ns_mode = AFE_NS_MODE_NET;
+        }
+    }
+#else
     afe_config->ns_init = false;
+#endif
     afe_config->vad_init = kUseAfeForVoiceProcessing;
     afe_config->vad_mode = VAD_MODE_0;
     afe_config->vad_min_noise_ms = 100;
