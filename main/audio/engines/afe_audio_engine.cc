@@ -175,7 +175,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
             afe_config->wakenet_model_name_2 = wakenet_models[1];
         }
     }
-    afe_config->agc_init = false;
+    // AGC normalizes mic level so quiet speech keeps a consistent amplitude
+    // through NS/Opus/server-VAD. Without it, low-volume utterances arrive
+    // under-represented for STT while the wake-word classifier still fires.
+    afe_config->agc_init = true;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     ESP_LOGI(TAG, "Before AFE create: free=%u min=%u largest=%u",

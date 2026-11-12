@@ -16,6 +16,9 @@ protected:
     void WriteRegs(uint8_t reg, const uint8_t* buffer, size_t length);
     uint8_t ReadReg(uint8_t reg);
     void ReadRegs(uint8_t reg, uint8_t* buffer, size_t length);
+    // Non-asserting read for sensors/PMICs that may be absent or slow to
+    // respond; callers handle ESP_ERR_TIMEOUT instead of crashing.
+    esp_err_t TryReadRegs(uint8_t reg, uint8_t* buffer, size_t length, int timeout_ms = 100);
     esp_err_t ResetBus(const char* reason);
 };
 

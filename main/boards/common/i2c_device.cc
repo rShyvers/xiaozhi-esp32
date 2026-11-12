@@ -48,6 +48,10 @@ void I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
     ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100));
 }
 
+esp_err_t I2cDevice::TryReadRegs(uint8_t reg, uint8_t* buffer, size_t length, int timeout_ms) {
+    return i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, timeout_ms);
+}
+
 esp_err_t I2cDevice::ResetBus(const char* reason) {
     ESP_LOGW(TAG, "Resetting I2C bus: %s", reason ? reason : "unspecified");
     return i2c_master_bus_reset(i2c_bus_);
