@@ -27,7 +27,7 @@ public:
 
     bool Initialize(AudioCodec* codec, srmodel_list_t* models_list);
     void Feed(const std::vector<int16_t>& data);
-    void FeedMono(const int16_t* data, size_t samples);
+    void FeedMono(const int16_t* data, size_t samples) override;
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
     void Start();
     void Stop();

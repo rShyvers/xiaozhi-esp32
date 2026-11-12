@@ -14,6 +14,9 @@ public:
     
     virtual bool Initialize(AudioCodec* codec, srmodel_list_t* models_list) = 0;
     virtual void Feed(const std::vector<int16_t>& data) = 0;
+    // Feed already-mono samples (e.g. AFE-processed audio). Default: no-op for
+    // implementations that only consume raw codec input via Feed().
+    virtual void FeedMono(const int16_t* data, size_t samples) { (void)data; (void)samples; }
     virtual void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) = 0;
     virtual void Start() = 0;
     virtual void Stop() = 0;

@@ -42,6 +42,11 @@ public:
     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
 
+    // Boards may install a factory providing their own WakeWord implementation
+    // (e.g. a board-specific TFLite model). Must be called before the engine is
+    // initialized; takes precedence over MultiNet/WakeNet model selection.
+    static void SetCustomWakeWordFactory(std::function<std::unique_ptr<WakeWord>()>&& factory);
+
     void EncodeWakeWordData() override;
     bool GetWakeWordOpus(std::vector<uint8_t>& opus) override;
     const std::string& GetLastDetectedWakeWord() const override { return last_detected_wake_word_; }
@@ -51,6 +56,8 @@ private:
         kNone,
         kWakeNet,
         kMultiNet,
+        // Board-provided wake word implementation (see SetCustomWakeWordFactory)
+        kCustomBoard,
     };
 
     static constexpr EventBits_t kWakeWordEnabled = 1 << 0;
@@ -81,7 +88,14 @@ private:
     std::atomic<uint32_t> control_generation_{0};
     WakeDetector wake_detector_ = WakeDetector::kNone;
 
-    std::unique_ptr<CustomWakeWord> custom_wake_word_;
+    // Holds either the built-in CustomWakeWord or a board-provided WakeWord
+    // (see SetCustomWakeWordFactory).
+    std::unique_ptr<WakeWord> custom_wake_word_;
+
+    // Optional board-supplied factory for the wake word implementation. When
+    // set, it takes precedence over model-based MultiNet/WakeNet selection so
+    // boards can run their own detector (e.g. a board-specific TFLite model).
+    static std::function<std::unique_ptr<WakeWord>()> custom_wake_word_factory_;
     std::vector<std::string> wake_words_;
     std::string last_detected_wake_word_;
     std::vector<int16_t> input_buffer_;

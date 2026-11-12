@@ -21,6 +21,12 @@ static constexpr bool kUseAfeForVoiceProcessing = true;
 static constexpr bool kUseAfeForVoiceProcessing = false;
 #endif
 
+std::function<std::unique_ptr<WakeWord>()> AfeAudioEngine::custom_wake_word_factory_;
+
+void AfeAudioEngine::SetCustomWakeWordFactory(std::function<std::unique_ptr<WakeWord>()>&& factory) {
+    custom_wake_word_factory_ = std::move(factory);
+}
+
 AfeAudioEngine::AfeAudioEngine() { event_group_ = xEventGroupCreate(); }
 
 AfeAudioEngine::~AfeAudioEngine() {
@@ -80,7 +86,26 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
         }
     }
 
-    if (multinet_model_name != nullptr) {
+    if (custom_wake_word_factory_) {
+        // Board-provided wake word implementation takes precedence over the
+        // model-based selection below.
+        wake_detector_ = WakeDetector::kCustomBoard;
+        custom_wake_word_ = custom_wake_word_factory_();
+        custom_wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
+            last_detected_wake_word_ = wake_word;
+            xEventGroupClearBits(event_group_, kWakeWordEnabled);
+            UpdateActiveState();
+            if (wake_word_detected_callback_) {
+                wake_word_detected_callback_(wake_word);
+            }
+        });
+        if (!custom_wake_word_->Initialize(codec_, models_)) {
+            ESP_LOGE(TAG, "Failed to initialize board-provided wake-word detector");
+            custom_wake_word_.reset();
+            wake_detector_ = WakeDetector::kNone;
+            return false;
+        }
+    } else if (multinet_model_name != nullptr) {
         wake_detector_ = WakeDetector::kMultiNet;
         custom_wake_word_ = std::make_unique<CustomWakeWord>();
         custom_wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
@@ -445,7 +470,7 @@ void AfeAudioEngine::ProcessingTask() {
 }
 
 void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
-    if (wake_detector_ == WakeDetector::kMultiNet) {
+    if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kCustomBoard) {
         custom_wake_word_->FeedMono(result->data, result->data_size / sizeof(int16_t));
         return;
     }
@@ -528,7 +553,7 @@ void AfeAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
 }
 
 void AfeAudioEngine::EncodeWakeWordData() {
-    if (wake_detector_ == WakeDetector::kMultiNet) {
+    if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kCustomBoard) {
         custom_wake_word_->EncodeWakeWordData();
         return;
     }
@@ -619,7 +644,7 @@ void AfeAudioEngine::EncodeWakeWordData() {
 }
 
 bool AfeAudioEngine::GetWakeWordOpus(std::vector<uint8_t>& opus) {
-    if (wake_detector_ == WakeDetector::kMultiNet) {
+    if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kCustomBoard) {
         return custom_wake_word_->GetWakeWordOpus(opus);
     }
     if (wake_detector_ != WakeDetector::kWakeNet) {
