@@ -154,6 +154,26 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    // Persistent warm audio channel: keep the channel open while idle so a
+    // wake word does not pay the ~1s connect handshake, and re-establish it
+    // (with clock-driven backoff) when the server reaps it or the network
+    // recovers. Opens happen in a single-flight background task; every other
+    // code path joins that open instead of starting a second one.
+    bool network_ready_ = false;
+    bool audio_channel_opening_ = false;
+    uint32_t next_audio_channel_attempt_ms_ = 0;
+    uint32_t audio_channel_retry_delay_ms_ = 5000;
+    uint32_t audio_channel_generation_ = 0;
+    std::function<void()> audio_channel_ready_;
+    std::vector<std::function<void()>> after_audio_channel_open_;
+
+
+    // Warm audio channel management
+    void EnsureAudioChannel();
+    void RequestAudioChannel(std::function<void()>&& ready);
+    void FinishAudioChannelOpen(bool opened, uint32_t generation);
+    void RunAfterAudioChannelOpen(std::function<void()>&& callback);
+    void ScheduleAfterAudioChannelOpen(std::function<void()>&& callback);
 
     // Event handlers
     void HandleStateChangedEvent();

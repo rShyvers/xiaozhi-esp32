@@ -12,8 +12,11 @@
 #include "text_glyph_payload.h"
 #include "websocket_protocol.h"
 
+#include <algorithm>
+
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <cstring>
@@ -273,6 +276,7 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+            EnsureAudioChannel();
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -284,8 +288,110 @@ void Application::Run() {
     }
 }
 
+// Only open while idle: the wake path (BeginWakeWordInvoke) and the touch
+// path (HandleToggleChatEvent) drive their own opens through the Connecting
+// state, and a concurrent idle reopen would race them.
+void Application::EnsureAudioChannel() {
+    if (!network_ready_ || audio_channel_opening_ ||
+        !protocol_ || GetDeviceState() != kDeviceStateIdle) {
+        return;
+    }
+    if (esp_timer_get_time() / 1000 < next_audio_channel_attempt_ms_) {
+        return;  // The clock tick will retry when the backoff expires.
+    }
+    RequestAudioChannel({});
+}
+
+void Application::RequestAudioChannel(std::function<void()>&& ready) {
+    if (!protocol_ || GetDeviceState() == kDeviceStateWifiConfiguring) {
+        return;
+    }
+    if (ready) {
+        audio_channel_ready_ = std::move(ready);
+    }
+    if (audio_channel_opening_) {
+        ESP_LOGI(TAG, "Joining audio channel open");
+        return;
+    }
+    if (protocol_->IsAudioChannelOpened()) {
+        auto continuation = std::move(audio_channel_ready_);
+        if (continuation) {
+            continuation();
+        }
+        return;
+    }
+    struct OpenRequest {
+        Application* app;
+        Protocol* protocol;
+        uint32_t generation;
+    };
+    auto* request = new OpenRequest{this, protocol_.get(), ++audio_channel_generation_};
+    // Publish ownership before task creation. Only this worker calls Open;
+    // every close/reset/reconnect waits for its main-loop completion.
+    audio_channel_opening_ = true;
+    next_audio_channel_attempt_ms_ = esp_timer_get_time() / 1000 + 5000;
+    ESP_LOGI(TAG, "Opening audio channel in background");
+    if (xTaskCreate([](void* arg) {
+        std::unique_ptr<OpenRequest> request(static_cast<OpenRequest*>(arg));
+        auto* app = request->app;
+        bool opened = request->protocol->OpenAudioChannel();
+        app->Schedule([app, opened, generation = request->generation]() {
+            app->FinishAudioChannelOpen(opened, generation);
+        });
+        request.reset();
+        vTaskDelete(nullptr);
+    }, "audio_open", 4096, request, 3, nullptr) != pdPASS) {
+        auto generation = request->generation;
+        delete request;
+        ESP_LOGE(TAG, "Failed to create audio channel opener");
+        FinishAudioChannelOpen(false, generation);
+    }
+}
+
+void Application::FinishAudioChannelOpen(bool opened, uint32_t generation) {
+    audio_channel_opening_ = false;
+    auto continuation = std::move(audio_channel_ready_);
+    if (opened) {
+        audio_channel_retry_delay_ms_ = 5000;
+    } else {
+        next_audio_channel_attempt_ms_ = esp_timer_get_time() / 1000 + audio_channel_retry_delay_ms_;
+        ESP_LOGW(TAG, "Audio channel open failed; retry in %lu ms", (unsigned long)audio_channel_retry_delay_ms_);
+        audio_channel_retry_delay_ms_ = std::min<uint32_t>(audio_channel_retry_delay_ms_ * 2, 30000);
+        if (GetDeviceState() == kDeviceStateConnecting) {
+            // A wake/touch invocation joined this open; without a channel the
+            // device would be stuck in Connecting.
+            SetDeviceState(kDeviceStateIdle);
+            audio_service_.EnableWakeWordDetection(true);
+        }
+    }
+    auto deferred = std::move(after_audio_channel_open_);
+    for (auto& callback : deferred) {
+        callback();
+    }
+    if (opened && generation == audio_channel_generation_ && continuation &&
+        network_ready_ && protocol_ && protocol_->IsAudioChannelOpened()) {
+        continuation();
+    }
+}
+
+void Application::RunAfterAudioChannelOpen(std::function<void()>&& callback) {
+    if (audio_channel_opening_) {
+        after_audio_channel_open_.push_back(std::move(callback));
+    } else {
+        callback();
+    }
+}
+
+void Application::ScheduleAfterAudioChannelOpen(std::function<void()>&& callback) {
+    Schedule([this, callback = std::move(callback)]() mutable {
+        RunAfterAudioChannelOpen(std::move(callback));
+    });
+}
+
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    network_ready_ = true;
+    audio_channel_retry_delay_ms_ = 5000;
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -304,6 +410,9 @@ void Application::HandleNetworkConnectedEvent() {
                 vTaskDelete(NULL);
             },
             "activation", 4096 * 2, this, 2, &activation_task_handle_);
+    } else if (state == kDeviceStateIdle) {
+        // Network recovered while idle — restore the warm channel.
+        EnsureAudioChannel();
     }
 
     // Update the status bar immediately to show the network state
@@ -313,6 +422,7 @@ void Application::HandleNetworkConnectedEvent() {
 
 void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
+    network_ready_ = false;
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
         StopNotification();
@@ -805,8 +915,9 @@ void Application::HandleToggleChatEvent() {
         ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
-            Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
+            // Join (or start) the single-flight background open; see
+            // BeginWakeWordInvoke for why a separate scheduled open would race.
+            RequestAudioChannel([this, mode]() { ContinueOpenAudioChannel(mode); });
             return;
         }
         SetListeningMode(mode);
@@ -944,9 +1055,10 @@ void Application::BeginWakeWordInvoke(const std::string& wake_word) {
     }
 
     if (!protocol_->IsAudioChannelOpened()) {
-        // Schedule to let the state change be processed first (UI update),
-        // then continue with OpenAudioChannel which may block for ~1 second
-        Schedule([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
+        // Join (or start) the single-flight background open; the continuation
+        // runs on the main loop once the channel is confirmed open. Scheduling
+        // a separate OpenAudioChannel here would race a concurrent idle reopen.
+        RequestAudioChannel([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
         return;
     }
     // Channel already opened, continue directly
@@ -1011,8 +1123,12 @@ void Application::HandleStateChangedEvent() {
             if (last_error_message_.empty()) {
                 display->SetStatus(Lang::Strings::STANDBY);
                 display->ClearChatMessages();  // Clear messages first
+#if defined(CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN)
+                display->SetEmotion("sleepy");
+#else
                 display->SetEmotion(
                     "neutral");  // Then set emotion (wechat mode checks child count)
+#endif
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
